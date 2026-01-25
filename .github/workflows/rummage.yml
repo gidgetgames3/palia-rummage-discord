@@ -15,16 +15,15 @@ jobs:
           pip install requests pillow playwright
           python -m playwright install --with-deps chromium
 
-      - name: Render maps + post screenshot collage to Discord
+      - name: Render maps + extract grid + post to Discord
         env:
           WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
           python - <<'EOF'
-          import os, io, json
+          import os, io, json, re
           import requests
           from datetime import datetime
           from PIL import Image
-
           from playwright.sync_api import sync_playwright
 
           webhook = os.environ.get("WEBHOOK")
@@ -37,7 +36,17 @@ jobs:
               ("🌲 Elderwood", "https://palia.th.gl/rummage-pile?map=elderwood"),
           ]
 
+          GRID_RE = re.compile(r"\b([A-Z])\s?([1-9]|1[0-9])\b")  # A1..Z19 (covers C6 etc.)
+
+          def best_grid_from_text(text: str):
+              # Prefer letter+number like C6; return first match
+              m = GRID_RE.search(text)
+              if not m:
+                  return None
+              return f"{m.group(1)}{m.group(2)}"
+
           screenshots = []
+          grid_results = {}
 
           with sync_playwright() as p:
               browser = p.chromium.launch()
@@ -45,27 +54,58 @@ jobs:
               page = context.new_page()
 
               for name, url in maps:
-                  page.goto(url, wait_until="networkidle", timeout=60000)
-                  page.wait_for_timeout(3000)  # let tiles/markers settle
+                  # collect grids observed while loading this specific map
+                  seen_grids = []
 
+                  def on_response(resp):
+                      try:
+                          ct = (resp.headers.get("content-type") or "").lower()
+                          if "application/json" not in ct:
+                              return
+                          # Only inspect responses from th.gl domains
+                          if "th.gl" not in resp.url:
+                              return
+                          data = resp.json()
+                          blob = json.dumps(data, ensure_ascii=False)
+                          g = best_grid_from_text(blob)
+                          if g:
+                              seen_grids.append(g)
+                      except Exception:
+                          pass
+
+                  page.on("response", on_response)
+
+                  page.goto(url, wait_until="networkidle", timeout=60000)
+                  page.wait_for_timeout(4000)  # let late fetches finish
+
+                  # Pick the most common grid code we saw (reduces random false positives)
+                  if seen_grids:
+                      # count frequency
+                      freq = {}
+                      for g in seen_grids:
+                          freq[g] = freq.get(g, 0) + 1
+                      grid = sorted(freq.items(), key=lambda x: (-x[1], x[0]))[0][0]
+                  else:
+                      grid = None
+
+                  grid_results[name] = grid
+
+                  # Screenshot
                   png_bytes = page.screenshot(full_page=False)
                   img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
-
-                  # Crop off a bit of the top nav to focus on the map area
                   w, h = img.size
                   crop_top = 110
                   img = img.crop((0, crop_top, w, h))
-
                   screenshots.append(img)
+
+                  # remove listener so the next map doesn't inherit previous handlers
+                  page.remove_listener("response", on_response)
 
               browser.close()
 
-          # Make a vertical collage
-          widths = [im.size[0] for im in screenshots]
-          heights = [im.size[1] for im in screenshots]
-          collage_w = max(widths)
-          collage_h = sum(heights)
-
+          # Create vertical collage image
+          collage_w = max(im.size[0] for im in screenshots)
+          collage_h = sum(im.size[1] for im in screenshots)
           collage = Image.new("RGB", (collage_w, collage_h), (255, 255, 255))
           y = 0
           for im in screenshots:
@@ -76,14 +116,19 @@ jobs:
           collage.save(out, format="PNG", optimize=True)
           out.seek(0)
 
-          # Build embed
+          # Build embed fields with grid text
           fields = []
           for name, url in maps:
-              fields.append({"name": name, "value": f"[Open map]({url})", "inline": False})
+              grid = grid_results.get(name)
+              if grid:
+                  value = f"**Loot pile:** `{grid}`\n[Open map]({url})"
+              else:
+                  value = f"**Loot pile:** `(grid not detected)`\n[Open map]({url})"
+              fields.append({"name": name, "value": value, "inline": False})
 
           embed = {
               "title": "🗓️ Today's Rummage Piles",
-              "description": "Rendered daily from palia.th.gl (3 maps).",
+              "description": "Map + grid callouts (3 maps).",
               "fields": fields,
               "image": {"url": "attachment://rummage.png"},
               "footer": {"text": "Source: palia.th.gl"},
@@ -91,8 +136,6 @@ jobs:
           }
 
           payload_json = {"username": "Palia Rummage Tracker", "embeds": [embed]}
-
-          # Webhook file upload uses multipart/form-data with payload_json + file
           files = {
               "payload_json": (None, json.dumps(payload_json), "application/json"),
               "files[0]": ("rummage.png", out, "image/png"),
