@@ -1,0 +1,60 @@
+name: Daily Palia Rummage Post
+
+on:
+  schedule:
+    - cron: "0 13 * * *"  # runs daily (adjust time)
+  workflow_dispatch:
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Fetch rummage data and post to Discord
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          pip install requests beautifulsoup4
+          python << 'EOF'
+          import requests
+          from bs4 import BeautifulSoup
+          from datetime import datetime
+
+          maps = {
+              "Kilima Valley": "https://palia.th.gl/rummage-pile?map=kilima-valley",
+              "Bahari Bay": "https://palia.th.gl/rummage-pile?map=bahari-bay",
+              "Elderwood": "https://palia.th.gl/rummage-pile?map=elderwood"
+          }
+
+          fields = []
+
+          for name, url in maps.items():
+              r = requests.get(url)
+              soup = BeautifulSoup(r.text, "html.parser")
+
+              # Fallback-safe extraction
+              text = soup.get_text(" ", strip=True)
+              snippet = text[:300] + "..."
+
+              fields.append({
+                  "name": name,
+                  "value": snippet
+              })
+
+          embed = {
+              "title": "🗓️ Today's Rummage Piles",
+              "description": "Daily locations from palia.th.gl",
+              "color": 5793266,
+              "fields": fields,
+              "footer": {"text": "Source: palia.th.gl"},
+              "timestamp": datetime.utcnow().isoformat()
+          }
+
+          payload = {
+              "username": "Palia Rummage Tracker",
+              "embeds": [embed]
+          }
+
+          requests.post(WEBHOOK, json=payload)
+          EOF
+
