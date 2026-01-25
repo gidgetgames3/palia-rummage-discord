@@ -14,7 +14,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Post clean embed to Discord
+      - name: Debug TH.GL pages and post to Discord
         env:
           WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
@@ -27,6 +27,8 @@ jobs:
           if not webhook:
               raise SystemExit("Missing DISCORD_WEBHOOK_URL secret (WEBHOOK env var is empty).")
 
+          HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; PaliaRummageBot/1.0)"}
+
           maps = {
               "🌿 Kilima Valley": "https://palia.th.gl/rummage-pile?map=kilima-valley",
               "🌊 Bahari Bay": "https://palia.th.gl/rummage-pile?map=bahari-bay",
@@ -35,17 +37,22 @@ jobs:
 
           fields = []
           for name, url in maps.items():
+              r = requests.get(url, headers=HEADERS, timeout=25)
+              r.raise_for_status()
+
+              has_next = "__NEXT_DATA__" in r.text
+
               fields.append({
                   "name": name,
-                  "value": f"[Open today’s rummage map]({url})",
+                  "value": f"__NEXT_DATA__ present: `{has_next}`\n[Open today’s rummage map]({url})",
                   "inline": False
               })
 
           embed = {
-              "title": "🗓️ Today's Rummage Piles",
-              "description": "Daily locations (3 maps).",
+              "title": "🗓️ Today's Rummage Piles (Debug)",
+              "description": "Checking whether TH.GL exposes embedded data we can parse.",
               "fields": fields,
-              "footer": {"text": "Source: palia.th.gl"},
+              "footer": {"text": "Temporary debug run"},
               "timestamp": datetime.utcnow().isoformat()
           }
 
