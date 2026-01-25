@@ -1,41 +1,62 @@
-import os
-import requests
-from bs4 import BeautifulSoup
-from datetime import datetime
+name: Daily Palia Rummage Post
 
-WEBHOOK = os.environ["WEBHOOK"]  # ✅ pulls from GitHub Actions env var
+on:
+  schedule:
+    - cron: "0 13 * * *"
+  workflow_dispatch:
 
-maps = {
-    "Kilima Valley": "https://palia.th.gl/rummage-pile?map=kilima-valley",
-    "Bahari Bay": "https://palia.th.gl/rummage-pile?map=bahari-bay",
-    "Elderwood": "https://palia.th.gl/rummage-pile?map=elderwood"
-}
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4
 
-fields = []
+      - name: Fetch rummage data and post to Discord
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          python - <<'EOF'
+          import os
+          import requests
+          from bs4 import BeautifulSoup
+          from datetime import datetime
 
-for name, url in maps.items():
-    r = requests.get(url, timeout=20)
-    soup = BeautifulSoup(r.text, "html.parser")
+          webhook = os.environ.get("WEBHOOK")
+          if not webhook:
+            raise SystemExit("Missing DISCORD_WEBHOOK_URL secret (WEBHOOK env var is empty).")
 
-    text = soup.get_text(" ", strip=True)
-    snippet = text[:300] + "..."
+          maps = {
+              "🌿 Kilima Valley": "https://palia.th.gl/rummage-pile?map=kilima-valley",
+              "🌊 Bahari Bay": "https://palia.th.gl/rummage-pile?map=bahari-bay",
+              "🌲 Elderwood": "https://palia.th.gl/rummage-pile?map=elderwood",
+          }
 
-    fields.append({
-        "name": name,
-        "value": snippet
-    })
+          fields = []
+          for name, url in maps.items():
+              r = requests.get(url, timeout=25)
+              r.raise_for_status()
+              soup = BeautifulSoup(r.text, "html.parser")
+              text = soup.get_text(" ", strip=True)
 
-embed = {
-    "title": "🗓️ Today's Rummage Piles",
-    "description": "Daily locations from palia.th.gl",
-    "fields": fields,
-    "footer": {"text": "Source: palia.th.gl"},
-    "timestamp": datetime.utcnow().isoformat()
-}
+              # temporary fallback so you at least see *something* post
+              snippet = (text[:250] + "...") if len(text) > 250 else text
 
-payload = {"username": "Palia Rummage Tracker", "embeds": [embed]}
+              fields.append({"name": name, "value": snippet, "inline": False})
 
-resp = requests.post(WEBHOOK, json=payload)
-print("Discord status:", resp.status_code)
-print(resp.text[:500])
-resp.raise_for_status()  # ✅ makes failures obvious in logs
+          embed = {
+              "title": "🗓️ Today's Rummage Piles",
+              "description": "Daily locations from palia.th.gl (3 maps).",
+              "fields": fields,
+              "footer": {"text": "Source: palia.th.gl"},
+              "timestamp": datetime.utcnow().isoformat()
+          }
+
+          payload = {"username": "Palia Rummage Tracker", "embeds": [embed]}
+          resp = requests.post(webhook, json=payload)
+          print("Discord status:", resp.status_code)
+          print(resp.text[:500])
+          resp.raise_for_status()
+          EOF
