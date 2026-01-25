@@ -2,7 +2,7 @@ name: Daily Palia Rummage Post
 
 on:
   schedule:
-    - cron: "0 13 * * *"
+    - cron: "0 5 * * *"   # 12:00am EST = 05:00 UTC
   workflow_dispatch:
 
 jobs:
@@ -30,67 +30,100 @@ jobs:
           if not webhook:
               raise SystemExit("Missing DISCORD_WEBHOOK_URL secret.")
 
-          maps = [
+          MAPS = [
               ("🌿 Kilima Valley", "https://palia.th.gl/rummage-pile?map=kilima-valley"),
               ("🌊 Bahari Bay", "https://palia.th.gl/rummage-pile?map=bahari-bay"),
               ("🌲 Elderwood", "https://palia.th.gl/rummage-pile?map=elderwood"),
           ]
 
-          GRID_RE = re.compile(r"\b([A-Z])\s?([1-9]|1[0-9])\b")  # A1..Z19 (covers C6 etc.)
+          GRID_RE = re.compile(r"\b([A-Z])\s?([1-9]|1[0-9]|20)\b")  # A1..Z20 (covers C6)
 
-          def best_grid_from_text(text: str):
-              # Prefer letter+number like C6; return first match
-              m = GRID_RE.search(text)
-              if not m:
-                  return None
-              return f"{m.group(1)}{m.group(2)}"
+          def extract_grid_from_text(text: str):
+              m = GRID_RE.search(text or "")
+              return f"{m.group(1)}{m.group(2)}" if m else None
+
+          # Try to click a rummage marker and read any popup/tooltip text
+          def detect_grid_from_ui(page):
+              # Candidate selectors for map tooltips/popups (covers common map libs)
+              popup_selectors = [
+                  '[role="tooltip"]',
+                  '.maplibregl-popup-content',
+                  '.mapboxgl-popup-content',
+                  '.leaflet-popup-content',
+                  '.tippy-content',
+                  '[data-state="open"]',
+              ]
+
+              # Candidate selectors to click rummage markers/icons
+              click_targets = [
+                  '[aria-label*="Rummage" i]',
+                  '[title*="Rummage" i]',
+                  'text=/Rummage/i',
+                  '[aria-label*="Pile" i]',
+                  '[title*="Pile" i]',
+              ]
+
+              # 1) Try clicking something that looks like the rummage marker/button
+              for sel in click_targets:
+                  try:
+                      loc = page.locator(sel).first
+                      if loc.count() > 0:
+                          loc.click(timeout=1500)
+                          page.wait_for_timeout(800)
+                          break
+                  except Exception:
+                      pass
+
+              # 2) Read popup/tooltip content if it exists
+              for psel in popup_selectors:
+                  try:
+                      ploc = page.locator(psel).first
+                      if ploc.count() > 0:
+                          txt = ploc.inner_text(timeout=1500)
+                          g = extract_grid_from_text(txt)
+                          if g:
+                              return g, txt.strip()
+                  except Exception:
+                      pass
+
+              # 3) Fallback: scan a small set of likely UI containers for grid codes
+              # (avoid scanning full body because the loot table can be huge)
+              containers = [
+                  "main",
+                  "header",
+                  "aside",
+                  ".container",
+                  '[class*="map" i]',
+              ]
+              for csel in containers:
+                  try:
+                      cloc = page.locator(csel).first
+                      if cloc.count() > 0:
+                          txt = cloc.inner_text(timeout=1500)
+                          g = extract_grid_from_text(txt)
+                          if g:
+                              return g, None
+                  except Exception:
+                      pass
+
+              return None, None
 
           screenshots = []
-          grid_results = {}
+          map_results = {}  # name -> (grid, extra_text)
 
           with sync_playwright() as p:
               browser = p.chromium.launch()
               context = browser.new_context(viewport={"width": 1280, "height": 720})
               page = context.new_page()
 
-              for name, url in maps:
-                  # collect grids observed while loading this specific map
-                  seen_grids = []
-
-                  def on_response(resp):
-                      try:
-                          ct = (resp.headers.get("content-type") or "").lower()
-                          if "application/json" not in ct:
-                              return
-                          # Only inspect responses from th.gl domains
-                          if "th.gl" not in resp.url:
-                              return
-                          data = resp.json()
-                          blob = json.dumps(data, ensure_ascii=False)
-                          g = best_grid_from_text(blob)
-                          if g:
-                              seen_grids.append(g)
-                      except Exception:
-                          pass
-
-                  page.on("response", on_response)
-
+              for name, url in MAPS:
                   page.goto(url, wait_until="networkidle", timeout=60000)
-                  page.wait_for_timeout(4000)  # let late fetches finish
+                  page.wait_for_timeout(3500)  # let markers settle
 
-                  # Pick the most common grid code we saw (reduces random false positives)
-                  if seen_grids:
-                      # count frequency
-                      freq = {}
-                      for g in seen_grids:
-                          freq[g] = freq.get(g, 0) + 1
-                      grid = sorted(freq.items(), key=lambda x: (-x[1], x[0]))[0][0]
-                  else:
-                      grid = None
+                  grid, extra = detect_grid_from_ui(page)
+                  map_results[name] = (grid, extra)
 
-                  grid_results[name] = grid
-
-                  # Screenshot
+                  # Screenshot (cropping top nav a bit)
                   png_bytes = page.screenshot(full_page=False)
                   img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
                   w, h = img.size
@@ -98,12 +131,9 @@ jobs:
                   img = img.crop((0, crop_top, w, h))
                   screenshots.append(img)
 
-                  # remove listener so the next map doesn't inherit previous handlers
-                  page.remove_listener("response", on_response)
-
               browser.close()
 
-          # Create vertical collage image
+          # Build vertical collage image
           collage_w = max(im.size[0] for im in screenshots)
           collage_h = sum(im.size[1] for im in screenshots)
           collage = Image.new("RGB", (collage_w, collage_h), (255, 255, 255))
@@ -116,14 +146,14 @@ jobs:
           collage.save(out, format="PNG", optimize=True)
           out.seek(0)
 
-          # Build embed fields with grid text
+          # Build embed fields with grid callouts + links
           fields = []
-          for name, url in maps:
-              grid = grid_results.get(name)
+          for (name, url) in MAPS:
+              grid, extra = map_results.get(name, (None, None))
               if grid:
                   value = f"**Loot pile:** `{grid}`\n[Open map]({url})"
               else:
-                  value = f"**Loot pile:** `(grid not detected)`\n[Open map]({url})"
+                  value = f"**Loot pile:** `(not detected yet)`\n[Open map]({url})"
               fields.append({"name": name, "value": value, "inline": False})
 
           embed = {
