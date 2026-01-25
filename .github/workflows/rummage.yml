@@ -45,7 +45,6 @@ jobs:
     "inline": False
 })
 
-
           embed = {
               "title": "🗓️ Today's Rummage Piles",
               "description": "Daily locations from palia.th.gl (3 maps).",
