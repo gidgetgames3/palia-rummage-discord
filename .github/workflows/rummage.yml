@@ -40,28 +40,33 @@ jobs:
 
           with sync_playwright() as p:
               browser = p.chromium.launch()
-              # Reduced viewport height (and slightly narrower) for Discord-friendly images
+              # Discord-friendly viewport
               context = browser.new_context(viewport={"width": 1100, "height": 600})
               page = context.new_page()
 
               for name, url in maps:
                   page.goto(url, wait_until="networkidle", timeout=60000)
-                  page.wait_for_timeout(2500)  # let markers/tiles settle
+                  page.wait_for_timeout(2500)
 
                   png_bytes = page.screenshot(full_page=False)
                   img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
 
-                  # --- Cropping tuned for TH.GL layout (removes sidebars + ads) ---
+                  # --- CROPPING (fine-tuned from your feedback) ---
                   w, h = img.size
-                  crop_top = int(0.18 * h)     # header / ads
-                  crop_bottom = int(0.96 * h)  # footer / extra whitespace
-                  crop_left = int(0.14 * w)    # left sidebar
-                  crop_right = int(0.86 * w)   # right whitespace
+
+                  crop_top = int(0.22 * h)      # ⬆️ more cropped from top
+                  crop_bottom = int(0.985 * h)  # ⬇️ less cropped from bottom
+                  crop_left = int(0.14 * w)     # perfect as-is
+                  crop_right = int(0.86 * w)    # perfect as-is
+
                   img = img.crop((crop_left, crop_top, crop_right, crop_bottom))
 
-                  # --- Optional polish: subtle border around each map ---
+                  # --- Optional polish: subtle border ---
                   draw = ImageDraw.Draw(img)
-                  draw.rectangle([0, 0, img.size[0]-1, img.size[1]-1], outline=(200, 200, 200))
+                  draw.rectangle(
+                      [0, 0, img.size[0]-1, img.size[1]-1],
+                      outline=(200, 200, 200)
+                  )
 
                   screenshots.append(img)
 
@@ -81,7 +86,7 @@ jobs:
           collage.save(out, format="PNG", optimize=True)
           out.seek(0)
 
-          # Build embed fields (simple: link + image)
+          # Embed fields
           fields = []
           for name, url in maps:
               fields.append({
@@ -99,7 +104,10 @@ jobs:
               "timestamp": datetime.utcnow().isoformat()
           }
 
-          payload_json = {"username": "Palia Rummage Tracker", "embeds": [embed]}
+          payload_json = {
+              "username": "Palia Rummage Tracker",
+              "embeds": [embed]
+          }
 
           files = {
               "payload_json": (None, json.dumps(payload_json), "application/json"),
