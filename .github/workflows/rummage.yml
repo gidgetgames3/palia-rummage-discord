@@ -1,60 +1,41 @@
-name: Daily Palia Rummage Post
+import os
+import requests
+from bs4 import BeautifulSoup
+from datetime import datetime
 
-on:
-  schedule:
-    - cron: "0 13 * * *"  # runs daily (adjust time)
-  workflow_dispatch:
+WEBHOOK = os.environ["WEBHOOK"]  # ✅ pulls from GitHub Actions env var
 
-jobs:
-  post:
-    runs-on: ubuntu-latest
+maps = {
+    "Kilima Valley": "https://palia.th.gl/rummage-pile?map=kilima-valley",
+    "Bahari Bay": "https://palia.th.gl/rummage-pile?map=bahari-bay",
+    "Elderwood": "https://palia.th.gl/rummage-pile?map=elderwood"
+}
 
-    steps:
-      - name: Fetch rummage data and post to Discord
-        env:
-          WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: |
-          pip install requests beautifulsoup4
-          python << 'EOF'
-          import requests
-          from bs4 import BeautifulSoup
-          from datetime import datetime
+fields = []
 
-          maps = {
-              "Kilima Valley": "https://palia.th.gl/rummage-pile?map=kilima-valley",
-              "Bahari Bay": "https://palia.th.gl/rummage-pile?map=bahari-bay",
-              "Elderwood": "https://palia.th.gl/rummage-pile?map=elderwood"
-          }
+for name, url in maps.items():
+    r = requests.get(url, timeout=20)
+    soup = BeautifulSoup(r.text, "html.parser")
 
-          fields = []
+    text = soup.get_text(" ", strip=True)
+    snippet = text[:300] + "..."
 
-          for name, url in maps.items():
-              r = requests.get(url)
-              soup = BeautifulSoup(r.text, "html.parser")
+    fields.append({
+        "name": name,
+        "value": snippet
+    })
 
-              # Fallback-safe extraction
-              text = soup.get_text(" ", strip=True)
-              snippet = text[:300] + "..."
+embed = {
+    "title": "🗓️ Today's Rummage Piles",
+    "description": "Daily locations from palia.th.gl",
+    "fields": fields,
+    "footer": {"text": "Source: palia.th.gl"},
+    "timestamp": datetime.utcnow().isoformat()
+}
 
-              fields.append({
-                  "name": name,
-                  "value": snippet
-              })
+payload = {"username": "Palia Rummage Tracker", "embeds": [embed]}
 
-          embed = {
-              "title": "🗓️ Today's Rummage Piles",
-              "description": "Daily locations from palia.th.gl",
-              "color": 5793266,
-              "fields": fields,
-              "footer": {"text": "Source: palia.th.gl"},
-              "timestamp": datetime.utcnow().isoformat()
-          }
-
-          payload = {
-              "username": "Palia Rummage Tracker",
-              "embeds": [embed]
-          }
-
-          requests.post(WEBHOOK, json=payload)
-          EOF
-
+resp = requests.post(WEBHOOK, json=payload)
+print("Discord status:", resp.status_code)
+print(resp.text[:500])
+resp.raise_for_status()  # ✅ makes failures obvious in logs
