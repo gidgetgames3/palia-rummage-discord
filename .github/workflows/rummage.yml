@@ -2,7 +2,7 @@ name: Daily Palia Rummage Post
 
 on:
   schedule:
-    - cron: "0 5 * * *"   # 12:00am EST = 05:00 UTC
+    - cron: "0 5 * * *"   # 12:00am EST (winter) = 05:00 UTC
   workflow_dispatch:
 
 jobs:
@@ -12,16 +12,18 @@ jobs:
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests pillow playwright
+          pip install requests pillow playwright opencv-python-headless numpy
           python -m playwright install --with-deps chromium
 
-      - name: Render maps + extract grid + post to Discord
+      - name: Render maps + compute grid coords + post to Discord
         env:
           WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
           python - <<'EOF'
           import os, io, json, re
+          import numpy as np
           import requests
+          import cv2
           from datetime import datetime
           from PIL import Image
           from playwright.sync_api import sync_playwright
@@ -36,94 +38,185 @@ jobs:
               ("🌲 Elderwood", "https://palia.th.gl/rummage-pile?map=elderwood"),
           ]
 
-          GRID_RE = re.compile(r"\b([A-Z])\s?([1-9]|1[0-9]|20)\b")  # A1..Z20 (covers C6)
+          # --- Image helpers -------------------------------------------------
+          def pil_to_cv(img_pil: Image.Image):
+              arr = np.array(img_pil.convert("RGB"))
+              return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
 
-          def extract_grid_from_text(text: str):
-              m = GRID_RE.search(text or "")
-              return f"{m.group(1)}{m.group(2)}" if m else None
+          def detect_grid_bbox(bgr):
+              """Find a likely grid area bbox by detecting strong vertical/horizontal lines."""
+              gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+              edges = cv2.Canny(gray, 60, 160)
 
-          # Try to click a rummage marker and read any popup/tooltip text
-          def detect_grid_from_ui(page):
-              # Candidate selectors for map tooltips/popups (covers common map libs)
-              popup_selectors = [
-                  '[role="tooltip"]',
-                  '.maplibregl-popup-content',
-                  '.mapboxgl-popup-content',
-                  '.leaflet-popup-content',
-                  '.tippy-content',
-                  '[data-state="open"]',
-              ]
+              lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=120,
+                                      minLineLength=int(0.45*bgr.shape[1]), maxLineGap=10)
+              if lines is None:
+                  # fallback: use almost-full image
+                  h, w = bgr.shape[:2]
+                  return (int(0.08*w), int(0.08*h), int(0.92*w), int(0.92*h))
 
-              # Candidate selectors to click rummage markers/icons
-              click_targets = [
-                  '[aria-label*="Rummage" i]',
-                  '[title*="Rummage" i]',
-                  'text=/Rummage/i',
-                  '[aria-label*="Pile" i]',
-                  '[title*="Pile" i]',
-              ]
+              xs, ys = [], []
+              for x1,y1,x2,y2 in lines[:,0]:
+                  # keep mostly horizontal/vertical
+                  dx, dy = abs(x2-x1), abs(y2-y1)
+                  if dx > dy and dx > 0.45*bgr.shape[1]:
+                      xs += [x1,x2]; ys += [y1,y2]
+                  elif dy > dx and dy > 0.35*bgr.shape[0]:
+                      xs += [x1,x2]; ys += [y1,y2]
 
-              # 1) Try clicking something that looks like the rummage marker/button
-              for sel in click_targets:
-                  try:
-                      loc = page.locator(sel).first
-                      if loc.count() > 0:
-                          loc.click(timeout=1500)
-                          page.wait_for_timeout(800)
+              if not xs:
+                  h, w = bgr.shape[:2]
+                  return (int(0.08*w), int(0.08*h), int(0.92*w), int(0.92*h))
+
+              x_min, x_max = max(min(xs)-10, 0), min(max(xs)+10, bgr.shape[1]-1)
+              y_min, y_max = max(min(ys)-10, 0), min(max(ys)+10, bgr.shape[0]-1)
+              return (x_min, y_min, x_max, y_max)
+
+          def detect_grid_lines(bgr_grid):
+              """Detect vertical and horizontal grid line positions inside the grid bbox."""
+              gray = cv2.cvtColor(bgr_grid, cv2.COLOR_BGR2GRAY)
+              # grid lines are bright; threshold and strengthen long lines
+              _, th = cv2.threshold(gray, 185, 255, cv2.THRESH_BINARY)
+              th = cv2.medianBlur(th, 3)
+
+              h, w = th.shape[:2]
+
+              # vertical lines
+              v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(12, h//10)))
+              v = cv2.erode(th, v_kernel, iterations=1)
+              v = cv2.dilate(v, v_kernel, iterations=2)
+
+              # horizontal lines
+              h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(12, w//10), 1))
+              hz = cv2.erode(th, h_kernel, iterations=1)
+              hz = cv2.dilate(hz, h_kernel, iterations=2)
+
+              # projections (sum of white pixels per column/row)
+              col_sum = v.sum(axis=0)
+              row_sum = hz.sum(axis=1)
+
+              def pick_peaks(proj, min_dist=20):
+                  peaks = []
+                  thresh = 0.35 * np.max(proj) if np.max(proj) > 0 else 0
+                  for i, val in enumerate(proj):
+                      if val >= thresh:
+                          if not peaks or (i - peaks[-1]) >= min_dist:
+                              peaks.append(i)
+                  return peaks
+
+              v_lines = pick_peaks(col_sum, min_dist=max(14, w//30))
+              h_lines = pick_peaks(row_sum, min_dist=max(14, h//30))
+
+              # Need at least 2 lines each direction to form cells
+              if len(v_lines) < 2 or len(h_lines) < 2:
+                  return None, None
+
+              return v_lines, h_lines
+
+          def detect_blue_markers(bgr_grid):
+              """Detect blue circular markers; return list of (cx, cy) in grid image coords."""
+              hsv = cv2.cvtColor(bgr_grid, cv2.COLOR_BGR2HSV)
+
+              # Blue-ish range for the marker rings (tuned to your screenshot style)
+              lower = np.array([90, 60, 40])
+              upper = np.array([140, 255, 255])
+              mask = cv2.inRange(hsv, lower, upper)
+
+              # clean up
+              kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
+              mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+              mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+              contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+              pts = []
+              h, w = bgr_grid.shape[:2]
+
+              for c in contours:
+                  area = cv2.contourArea(c)
+                  if area < 60 or area > 4000:
+                      continue
+                  (x,y,ww,hh) = cv2.boundingRect(c)
+                  # rough circular-ish filter
+                  if ww < 8 or hh < 8:
+                      continue
+                  aspect = ww / float(hh)
+                  if aspect < 0.6 or aspect > 1.6:
+                      continue
+
+                  M = cv2.moments(c)
+                  if M["m00"] == 0:
+                      continue
+                  cx = int(M["m10"]/M["m00"])
+                  cy = int(M["m01"]/M["m00"])
+
+                  # keep points not too close to edges
+                  if 5 <= cx <= w-5 and 5 <= cy <= h-5:
+                      pts.append((cx, cy))
+
+              # de-duplicate close points
+              pts_sorted = []
+              for p in sorted(pts):
+                  if not pts_sorted:
+                      pts_sorted.append(p)
+                  else:
+                      if abs(p[0]-pts_sorted[-1][0]) > 6 or abs(p[1]-pts_sorted[-1][1]) > 6:
+                          pts_sorted.append(p)
+
+              return pts_sorted
+
+          def coords_from_points(points, v_lines, h_lines, col_labels, row_labels):
+              """Map marker points to grid labels based on nearest cell."""
+              v_lines = sorted(v_lines)
+              h_lines = sorted(h_lines)
+
+              cols = len(v_lines) - 1
+              rows = len(h_lines) - 1
+
+              # If label counts don't match detected grid, fall back safely
+              if len(col_labels) != cols:
+                  col_labels = [chr(ord('A')+i) for i in range(cols)]
+              if len(row_labels) != rows:
+                  row_labels = [str(i+1) for i in range(rows)]
+
+              out = []
+              for (x,y) in points:
+                  # find column cell index
+                  c = None
+                  for i in range(cols):
+                      if v_lines[i] <= x < v_lines[i+1]:
+                          c = i
                           break
-                  except Exception:
-                      pass
+                  # find row cell index
+                  r = None
+                  for j in range(rows):
+                      if h_lines[j] <= y < h_lines[j+1]:
+                          r = j
+                          break
+                  if c is None or r is None:
+                      continue
+                  out.append(f"{col_labels[c]}{row_labels[r]}")
 
-              # 2) Read popup/tooltip content if it exists
-              for psel in popup_selectors:
-                  try:
-                      ploc = page.locator(psel).first
-                      if ploc.count() > 0:
-                          txt = ploc.inner_text(timeout=1500)
-                          g = extract_grid_from_text(txt)
-                          if g:
-                              return g, txt.strip()
-                  except Exception:
-                      pass
+              # unique sorted in reading order-ish
+              uniq = []
+              for item in out:
+                  if item not in uniq:
+                      uniq.append(item)
+              return uniq
 
-              # 3) Fallback: scan a small set of likely UI containers for grid codes
-              # (avoid scanning full body because the loot table can be huge)
-              containers = [
-                  "main",
-                  "header",
-                  "aside",
-                  ".container",
-                  '[class*="map" i]',
-              ]
-              for csel in containers:
-                  try:
-                      cloc = page.locator(csel).first
-                      if cloc.count() > 0:
-                          txt = cloc.inner_text(timeout=1500)
-                          g = extract_grid_from_text(txt)
-                          if g:
-                              return g, None
-                  except Exception:
-                      pass
-
-              return None, None
-
+          # --- Main: render, screenshot, compute coords ----------------------
           screenshots = []
-          map_results = {}  # name -> (grid, extra_text)
+          coords_by_map = {}
 
           with sync_playwright() as p:
               browser = p.chromium.launch()
               context = browser.new_context(viewport={"width": 1280, "height": 720})
               page = context.new_page()
 
-              for name, url in MAPS:
+              for map_name, url in MAPS:
                   page.goto(url, wait_until="networkidle", timeout=60000)
-                  page.wait_for_timeout(3500)  # let markers settle
+                  page.wait_for_timeout(3500)
 
-                  grid, extra = detect_grid_from_ui(page)
-                  map_results[name] = (grid, extra)
-
-                  # Screenshot (cropping top nav a bit)
+                  # Screenshot visible area and crop off the top nav like before
                   png_bytes = page.screenshot(full_page=False)
                   img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
                   w, h = img.size
@@ -131,9 +224,34 @@ jobs:
                   img = img.crop((0, crop_top, w, h))
                   screenshots.append(img)
 
+                  bgr = pil_to_cv(img)
+                  x1,y1,x2,y2 = detect_grid_bbox(bgr)
+                  bgr_grid = bgr[y1:y2, x1:x2].copy()
+
+                  v_lines, h_lines = detect_grid_lines(bgr_grid)
+
+                  # Assume 10 columns A-J unless detection differs
+                  # We'll generate labels based on detected grid counts.
+                  if v_lines is not None and h_lines is not None:
+                      cols = len(v_lines) - 1
+                      rows = len(h_lines) - 1
+                      col_labels = [chr(ord('A')+i) for i in range(cols)]
+
+                      # Row numbers vary by map; we can’t read them as text reliably,
+                      # so we map top-to-bottom as increasing integers starting at 1.
+                      # This matches how most grids are referenced by players.
+                      row_labels = [str(i+1) for i in range(rows)]
+
+                      points = detect_blue_markers(bgr_grid)
+                      coords = coords_from_points(points, v_lines, h_lines, col_labels, row_labels)
+                  else:
+                      coords = []
+
+                  coords_by_map[map_name] = coords
+
               browser.close()
 
-          # Build vertical collage image
+          # Build vertical collage
           collage_w = max(im.size[0] for im in screenshots)
           collage_h = sum(im.size[1] for im in screenshots)
           collage = Image.new("RGB", (collage_w, collage_h), (255, 255, 255))
@@ -146,19 +264,23 @@ jobs:
           collage.save(out, format="PNG", optimize=True)
           out.seek(0)
 
-          # Build embed fields with grid callouts + links
+          # Embed fields
           fields = []
-          for (name, url) in MAPS:
-              grid, extra = map_results.get(name, (None, None))
-              if grid:
-                  value = f"**Loot pile:** `{grid}`\n[Open map]({url})"
+          for (map_name, url) in MAPS:
+              coords = coords_by_map.get(map_name, [])
+              if coords:
+                  coord_text = ", ".join(f"`{c}`" for c in coords)
               else:
-                  value = f"**Loot pile:** `(not detected yet)`\n[Open map]({url})"
-              fields.append({"name": name, "value": value, "inline": False})
+                  coord_text = "(not detected)"
+              fields.append({
+                  "name": map_name,
+                  "value": f"**Pile grid(s):** {coord_text}\n[Open map]({url})",
+                  "inline": False
+              })
 
           embed = {
               "title": "🗓️ Today's Rummage Piles",
-              "description": "Map + grid callouts (3 maps).",
+              "description": "Map + computed grid callouts (all visible pile markers).",
               "fields": fields,
               "image": {"url": "attachment://rummage.png"},
               "footer": {"text": "Source: palia.th.gl"},
