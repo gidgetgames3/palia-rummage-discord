@@ -1,8 +1,10 @@
 name: Daily Palia Rummage Post
 
+# schedule enabled
+# Runs daily at 1:00am EST (06:00 UTC)
 on:
   schedule:
-    - cron: "0 6 * * *"   # 1:00am EST = 06:00 UTC (becomes 2:00am EDT)
+    - cron: "0 6 * * *"
   workflow_dispatch:
 
 jobs:
