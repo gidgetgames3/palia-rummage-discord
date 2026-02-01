@@ -2,8 +2,10 @@ name: Daily Palia Rummage Post
 
 on:
   schedule:
-    - cron: "0 5 * * *"   # 12:00am EST (winter) = 05:00 UTC
+    - cron: "*/10 * * * *"
   workflow_dispatch:
+
+# schedule enabled
 
 jobs:
   post:
