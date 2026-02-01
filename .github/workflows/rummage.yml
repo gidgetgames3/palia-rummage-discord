@@ -2,10 +2,8 @@ name: Daily Palia Rummage Post
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "0 6 * * *"   # 1:00am EST = 06:00 UTC (becomes 2:00am EDT)
   workflow_dispatch:
-
-# schedule enabled
 
 jobs:
   post:
@@ -38,8 +36,6 @@ jobs:
               ("🌲 Elderwood", "https://palia.th.gl/rummage-pile?map=elderwood"),
           ]
 
-          screenshots = []
-
           # Candidate selectors for the map/grid container (we’ll try in order)
           MAP_SELECTORS = [
               "canvas",                 # some maps render to canvas
@@ -49,44 +45,59 @@ jobs:
               "main",                   # fallback: main content area
           ]
 
+          screenshots = []
+          failures = []  # keep track of maps that fail to render
+
           with sync_playwright() as p:
               browser = p.chromium.launch()
               context = browser.new_context(viewport={"width": 1100, "height": 700})
               page = context.new_page()
 
               for name, url in maps:
-                  page.goto(url, wait_until="networkidle", timeout=60000)
-                  page.wait_for_timeout(2500)
+                  try:
+                      page.goto(url, wait_until="networkidle", timeout=60000)
+                      page.wait_for_timeout(2500)
 
-                  # Find a good element to screenshot
-                  target = None
-                  for sel in MAP_SELECTORS:
-                      loc = page.locator(sel).first
-                      try:
-                          if loc.count() > 0:
-                              box = loc.bounding_box()
-                              if box and box["width"] > 400 and box["height"] > 250:
-                                  target = loc
-                                  break
-                      except Exception:
-                          pass
+                      # Find a good element to screenshot
+                      target = None
+                      for sel in MAP_SELECTORS:
+                          loc = page.locator(sel).first
+                          try:
+                              if loc.count() > 0:
+                                  box = loc.bounding_box()
+                                  if box and box["width"] > 400 and box["height"] > 250:
+                                      target = loc
+                                      break
+                          except Exception:
+                              pass
 
-                  if target is None:
-                      # Absolute fallback: full viewport screenshot
-                      png_bytes = page.screenshot(full_page=False)
-                  else:
-                      # Element screenshot = cleanest full-grid capture
-                      png_bytes = target.screenshot()
+                      if target is None:
+                          # Absolute fallback: full viewport screenshot
+                          png_bytes = page.screenshot(full_page=False)
+                      else:
+                          # Element screenshot = cleanest full-grid capture
+                          png_bytes = target.screenshot()
 
-                  img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+                      img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
 
-                  # Optional polish: subtle border
-                  draw = ImageDraw.Draw(img)
-                  draw.rectangle([0, 0, img.size[0]-1, img.size[1]-1], outline=(200, 200, 200))
+                      # Optional polish: subtle border
+                      draw = ImageDraw.Draw(img)
+                      draw.rectangle(
+                          [0, 0, img.size[0] - 1, img.size[1] - 1],
+                          outline=(200, 200, 200)
+                      )
 
-                  screenshots.append(img)
+                      screenshots.append(img)
+
+                  except Exception as e:
+                      failures.append((name, str(e)))
+                      print(f"[WARN] Failed to capture {name}: {e}")
 
               browser.close()
+
+          # If *everything* failed, stop with a clear error
+          if not screenshots:
+              raise SystemExit("All map screenshots failed. Check site availability or selectors.")
 
           # Build vertical collage
           collage_w = max(im.size[0] for im in screenshots)
@@ -104,13 +115,24 @@ jobs:
           collage.save(out, format="PNG", optimize=True)
           out.seek(0)
 
+          # Build embed fields (always include links)
           fields = []
           for name, url in maps:
-              fields.append({"name": name, "value": f"[Open today’s rummage map]({url})", "inline": False})
+              fields.append({
+                  "name": name,
+                  "value": f"[Open today’s rummage map]({url})",
+                  "inline": False
+              })
+
+          desc = "Daily full-grid screenshots (3 maps)."
+          if failures:
+              # Keep this short so it doesn’t look scary; it’s just informative
+              failed_names = ", ".join([f[0] for f in failures])
+              desc += f"\n⚠️ Note: screenshot issue for {failed_names} (link still included)."
 
           embed = {
               "title": "🗓️ Today's Rummage Piles",
-              "description": "Daily full-grid screenshots (3 maps).",
+              "description": desc,
               "fields": fields,
               "image": {"url": "attachment://rummage.png"},
               "footer": {"text": "Source: palia.th.gl"},
@@ -118,6 +140,7 @@ jobs:
           }
 
           payload_json = {"username": "Palia Rummage Tracker", "embeds": [embed]}
+
           files = {
               "payload_json": (None, json.dumps(payload_json), "application/json"),
               "files[0]": ("rummage.png", out, "image/png"),
