@@ -21,3 +21,16 @@ Repo → **Settings** → **Secrets and variables** → **Actions** → **New re
 ## Notes
 - GitHub schedules can be delayed by a few minutes sometimes.
 - If scheduled runs ever stop, make a small commit (e.g., edit this README) to “wake” schedules.
+
+## Troubleshooting
+### “Missing DISCORD_WEBHOOK_URL secret”
+You didn’t add the repository secret, or the name is wrong. It must be exactly:
+`DISCORD_WEBHOOK_URL`
+
+### No scheduled runs
+- Confirm workflow file is on the default branch (`main`)
+- Repo → Actions → ensure workflows are allowed
+- Make a small commit to wake schedules
+
+### It runs but doesn’t post in Discord
+- Confirm your webhook URL is valid and the Discord channel still exists
